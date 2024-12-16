@@ -53,6 +53,6 @@ This repository contains a comprehensive data analysis report examining factors 
 4. Missing age data for some observations
 
 ## Files
-R code: data analysis.Rmd
-Data: female.txt
-Report: Data Analysis Report.pdf
+- R code: data analysis.Rmd
+- Data: female.txt
+- Report: Data Analysis Report.pdf
