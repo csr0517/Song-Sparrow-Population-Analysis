@@ -51,3 +51,6 @@ This repository contains a comprehensive data analysis report examining factors 
 2. Some non-uniform residuals
 3. Potential fine-scale spatial structures not captured
 4. Missing age data for some observations
+
+## Data Code
+From data analysis.Rmd.
