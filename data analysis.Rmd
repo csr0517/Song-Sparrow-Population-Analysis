@@ -1,0 +1,1241 @@
+---
+title: "data analysis"
+output: html_document
+date: "2024-12-01"
+---
+
+Study Design
+
+DATA
+
+```{r}
+
+data <- read.table("/Users/chishouhiroshi/Downloads/female.txt", 
+                       header = TRUE, sep = "", stringsAsFactors = FALSE)
+head(data)  
+
+```
+
+
+
+DATA sample sizes
+
+```{r}
+sample_size <- nrow(data)
+cat("Sample size (number of rows):", sample_size, "\n")
+
+num_columns <- ncol(data)
+cat("Number of columns (variables):", num_columns, "\n")
+```
+
+
+```{r}
+summary(data)
+
+```
+
+
+
+Macro Explanatory Variables
+year: Reflects temporal variations affecting all sparrows in a given year.
+fpop: Number of females in the population each year—affects the entire population and can influence factors like competition or mating opportunities.
+
+Micro Explanatory Variables
+age: Individual sparrow's age.
+cohort: The year the sparrow was tagged; specific to each sparrow.
+x and y: Spatial coordinates of each nest; vary between individuals.
+band: id
+
+spf: response variable
+
+
+Check missing values
+
+For missing data - 
+
+```{r}
+
+# Visualize missing data pattern
+library(VIM)
+aggr_plot <- aggr(data, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, labels=names(data), cex.axis=.7, gap=3, ylab=c("Missing Data","Pattern"))
+
+```
+
+Deal with x,y and band
+
+```{r}
+library(dplyr)
+# Delete x, y or band row NA 
+data <- data %>%
+  filter(!is.na(x) & !is.na(y) & !is.na(band))
+
+cat("Number of rows after removing NA in x, y, and band:", nrow(data), "\n")
+
+```
+
+```{r}
+# Count missing values in 'cohort' and 'age'
+na_cohort <- sum(is.na(data$cohort))
+na_age <- sum(is.na(data$age))
+cat("Number of NA values in 'cohort':", na_cohort, "\n")
+cat("Number of NA values in 'age':", na_age, "\n")
+
+```
+
+corhort and age: MNAR (missing not at random) 
+
+Generalized linear mixed models (GLMMs) or maximum likelihood estimation (MLE) can account for missingness within the model.
+Bayesian methods can incorporate missing data directly in the modeling process.
+
+For age:
+
+```{r}
+
+library(lme4)
+library(dplyr)
+library(ggplot2)
+
+# Indicator
+data <- data %>%
+  mutate(
+    age_missing = ifelse(is.na(age), 1, 0),     
+    age_imputed = ifelse(is.na(age), -999, age) 
+  )
+
+
+```
+
+
+If overdispersion is detected, consider using a Negative Binomial GLMM.
+
+```{r}
+
+library(glmmTMB)
+
+# Negative Binomial GLMM
+model_nb <- glmmTMB(
+  spf ~ age_imputed + fpop + age_missing + (1 | year),
+  data = data,
+  family = nbinom2(link = "log")
+)
+
+summary(model_nb)
+```
+
+
+check again overdispersion
+
+```{r}
+# Check overdispersion again
+residual_deviance <- sum(residuals(model_nb, type = "pearson")^2)
+df_residual <- df.residual(model_nb)
+overdispersion <- residual_deviance / df_residual
+cat("Overdispersion:", overdispersion, "\n")
+```
+
+
+Deal with both missing values
+
+1.
+
+```{r}
+
+library(mice)
+library(glmmTMB)
+library(dplyr)
+
+# predictor matrix
+pred_matrix <- make.predictorMatrix(data)
+pred_matrix[c("band", "x", "y", "spf"), ] <- 0
+meth <- make.method(data)
+meth[c("cohort", "age")] <- "cart"
+
+# multiple imputation
+set.seed(123)
+imp <- mice(data, m = 5, maxit = 25, method = meth, predictorMatrix = pred_matrix, print = FALSE)
+
+# Initialize 
+estimates <- matrix(NA, nrow = 5, ncol = 4) 
+std_errors <- matrix(NA, nrow = 5, ncol = 4)
+colnames(estimates) <- c("Intercept", "age", "x", "y")
+colnames(std_errors) <- c("Intercept", "age", "x", "y")
+
+for(i in 1:5) {
+  imputed_data <- complete(imp, i)
+  
+  imputed_data$age <- imputed_data$year - imputed_data$cohort
+  
+  model <- try(glmmTMB(spf ~ age + x + y + (1|cohort),
+                       family = nbinom2,
+                       data = imputed_data))
+  
+  if(!inherits(model, "try-error")) {
+    coef_summary <- summary(model)$coefficients$cond
+    estimates[i,] <- coef_summary[, "Estimate"]
+    std_errors[i,] <- coef_summary[, "Std. Error"]
+  }
+}
+
+# pooled estimates using Rubin's rules
+pooled_estimates <- colMeans(estimates)
+within_var <- colMeans(std_errors^2)
+between_var <- apply(estimates, 2, var)
+total_var <- within_var + between_var + between_var/5
+pooled_se <- sqrt(total_var)
+
+results <- data.frame(
+  Parameter = colnames(estimates),
+  Estimate = pooled_estimates,
+  SE = pooled_se,
+  t_value = pooled_estimates/pooled_se,
+  p_value = 2 * pt(abs(pooled_estimates/pooled_se), df = 4, lower.tail = FALSE)
+)
+
+cat("\nPooled Results from Multiple Imputation:\n")
+print(results, digits = 4)
+cat("\nNumber of imputations:", imp$m)
+cat("\nNumber of iterations:", imp$maxit)
+cat("\nImputed variables: age and cohort\n")
+
+# diagnostic information
+first_model <- glmmTMB(spf ~ age + x + y + (1|cohort),
+                      family = nbinom2,
+                      data = complete(imp, 1))
+
+cat("\nDiagnostic Information (from first imputed dataset):\n")
+resids <- residuals(first_model)
+cat("Residual summary:\n")
+print(summary(resids))
+pearson_resid <- residuals(first_model, type = "pearson")
+overdispersion <- sum(pearson_resid^2) / df.residual(first_model)
+cat("\nOverdispersion ratio:", round(overdispersion, 3), "\n")
+
+```
+
+Tried MLE, Bay, GLMM... all did not work
+
+Drop cohort and age columns first
+
+```{r}
+
+# Drop columns
+data <- data[, !(names(data) %in% c("cohort", "age", "age_missing", "age_imputed"))]
+
+sample_size_2 <- nrow(data)
+cat("Sample size now (number of rows):", sample_size_2, "\n")
+
+head(data)
+
+```
+
+Confounding 
+
+(not include band)
+
+```{r}
+
+library(car)
+library(corrplot)
+library(ggplot2)
+library(dplyr)
+
+# 1. Correlation Analysis
+predictors <- c("year", "spf", "x", "y")
+cor_matrix <- cor(data[predictors], use = "complete.obs")
+cat("Correlation Matrix between Predictors:\n")
+print(round(cor_matrix, 4))
+corrplot(cor_matrix, method = "color", 
+         type = "upper", 
+         addCoef.col = "black",
+         tl.col = "black",
+         title = "Correlations Between Predictors")
+
+# 2. VIF Analysis
+model_vif <- lm(fpop ~ year + spf + x + y, data = data)
+vif_values <- vif(model_vif)
+cat("\nVariance Inflation Factors:\n")
+print(round(vif_values, 4))
+
+# 3. Check relationships  
+check_relationship <- function(data, var1, var2) {
+  cor_test <- cor.test(data[[var1]], data[[var2]])
+  model <- lm(data[[var2]] ~ data[[var1]])
+  r2 <- summary(model)$r.squared
+  
+  return(list(
+    vars = paste(var1, "-", var2),
+    correlation = cor_test$estimate,
+    p_value = cor_test$p.value,
+    r_squared = r2
+  ))
+}
+
+# Test relationships
+relationships <- list()
+for(i in 1:(length(predictors)-1)) {
+  for(j in (i+1):length(predictors)) {
+    result <- check_relationship(data, predictors[i], predictors[j])
+    relationships[[length(relationships) + 1]] <- result
+  }
+}
+
+cat("\nRelationships between Predictors:\n")
+for(rel in relationships) {
+  if(rel$p_value < 0.05) {  
+    cat("\nSignificant relationship found:", rel$vars, "\n")
+    cat("Correlation:", round(rel$correlation, 4), "\n")
+    cat("P-value:", format.pval(rel$p_value, digits = 4), "\n")
+    cat("R-squared:", round(rel$r_squared, 4), "\n")
+  }
+}
+cat("\nChecking for Independence:\n")
+spatial_model <- lm(fpop ~ x + y, data = data)
+cat("\nSpatial effects (x,y) on fpop:\n")
+print(summary(spatial_model)$coefficients)
+temporal_model <- lm(fpop ~ year, data = data)
+cat("\nTemporal effect (year) on fpop:\n")
+print(summary(temporal_model)$coefficients)
+cat("\nSummary of Potential Confounding Variables:\n")
+high_cors <- which(abs(cor_matrix) > 0.3 & abs(cor_matrix) < 1, arr.ind = TRUE)
+if(length(high_cors) > 0) {
+  cat("\n1. Moderately correlated predictors (|r| > 0.3):\n")
+  print(high_cors)
+} else {
+  cat("\n1. No concerning correlations between predictors found\n")
+}
+cat("\n2. VIF Analysis:\n")
+high_vif <- vif_values[vif_values > 2]
+if(length(high_vif) > 0) {
+  cat("Predictors with VIF > 2:\n")
+  print(high_vif)
+} else {
+  cat("No concerning VIF values found\n")
+}
+cat("\n3. Key findings:\n")
+significant_relationships <- sapply(relationships, function(x) x$p_value < 0.05)
+if(any(significant_relationships)) {
+  cat("Significant relationships found between predictors that might indicate confounding\n")
+} else {
+  cat("No significant relationships found between predictors\n")
+}
+```
+
+R-squared
+
+```{r}
+
+# R-squared
+get_detailed_rsquared <- function(var1, var2, data) {
+  model <- lm(data[[var2]] ~ data[[var1]])
+  r2 <- summary(model)$r.squared
+  cor_val <- cor(data[[var1]], data[[var2]])
+  
+  return(data.frame(
+    Variable1 = var1,
+    Variable2 = var2,
+    R_squared = round(r2, 6),
+    Correlation = round(cor_val, 6)
+  ))
+}
+
+vars <- c("year", "fpop", "x", "y")
+response <- "spf"
+
+results <- do.call(rbind, lapply(vars, function(v) {
+  get_detailed_rsquared(v, response, data)
+}))
+
+print("Detailed Analysis of Relationships with SPF:")
+print(results)
+cat("\nProportion of variance explained by each predictor:\n")
+full_model <- lm(spf ~ year + fpop + x + y, data = data)
+print(summary(full_model))
+```
+
+Add band
+```{r}
+
+library(car)
+library(corrplot)
+library(ggplot2)
+library(dplyr)
+
+# Correlation
+numeric_predictors <- c("year", "spf", "x", "y")
+cor_matrix <- cor(data[numeric_predictors], use = "complete.obs")
+cat("Correlation Matrix between Numeric Predictors:\n")
+print(round(cor_matrix, 4))
+
+corrplot(cor_matrix, method = "color", 
+         type = "upper", 
+         addCoef.col = "black",
+         tl.col = "black",
+         title = "Correlations Between Numeric Predictors")
+
+# VIF 
+model_vif <- lm(fpop ~ year + spf + x + y + factor(band), data = data)
+vif_values <- vif(model_vif)
+cat("\nVariance Inflation Factors:\n")
+print(round(vif_values[1:4], 4))  
+
+# relationships
+check_relationship <- function(data, var1, var2) {
+  cor_test <- cor.test(data[[var1]], data[[var2]])
+  model <- lm(data[[var2]] ~ data[[var1]])
+  r2 <- summary(model)$r.squared
+  
+  return(list(
+    vars = paste(var1, "-", var2),
+    correlation = cor_test$estimate,
+    p_value = cor_test$p.value,
+    r_squared = r2
+  ))
+}
+
+relationships <- list()
+for(i in 1:(length(numeric_predictors)-1)) {
+  for(j in (i+1):length(numeric_predictors)) {
+    result <- check_relationship(data, numeric_predictors[i], numeric_predictors[j])
+    relationships[[length(relationships) + 1]] <- result
+  }
+}
+
+# individual effects
+bird_counts <- data %>%
+  group_by(band) %>%
+  summarise(
+    n_obs = n(),
+    mean_spf = mean(spf),
+    sd_spf = sd(spf)
+  )
+
+cat("\nIndividual Bird Summary:\n")
+cat("Number of unique birds:", length(unique(data$band)), "\n")
+cat("Average observations per bird:", mean(bird_counts$n_obs), "\n")
+cat("Range of observations per bird:", range(bird_counts$n_obs), "\n")
+cat("\nSignificant Relationships between Predictors:\n")
+for(rel in relationships) {
+  if(rel$p_value < 0.05) {  
+    cat("\nSignificant relationship found:", rel$vars, "\n")
+    cat("Correlation:", round(rel$correlation, 4), "\n")
+    cat("P-value:", format.pval(rel$p_value, digits = 4), "\n")
+    cat("R-squared:", round(rel$r_squared, 4), "\n")
+  }
+}
+cat("\nChecking for Independence:\n")
+
+# Spatial effects
+spatial_model <- lm(fpop ~ x + y + factor(band), data = data)
+cat("\nSpatial effects (x,y) on fpop (controlling for individual):\n")
+print(summary(spatial_model)$coefficients[1:3,])  # Print only main effects
+
+# Temporal effects
+temporal_model <- lm(fpop ~ year + factor(band), data = data)
+cat("\nTemporal effect (year) on fpop (controlling for individual):\n")
+print(summary(temporal_model)$coefficients[1:2,])  # Print only main effects
+cat("\nSummary of Potential Confounding Variables:\n")
+
+# outputs
+high_cors <- which(abs(cor_matrix) > 0.3 & abs(cor_matrix) < 1, arr.ind = TRUE)
+if(length(high_cors) > 0) {
+  cat("\n1. Moderately correlated predictors (|r| > 0.3):\n")
+  print(high_cors)
+} else {
+  cat("\n1. No concerning correlations between numeric predictors found\n")
+}
+
+cat("\n2. VIF Analysis:\n")
+high_vif <- vif_values[vif_values > 2]
+if(length(high_vif) > 0) {
+  cat("Predictors with VIF > 2:\n")
+  print(high_vif)
+} else {
+  cat("No concerning VIF values found\n")
+}
+cat("\n3. Individual Bird Effects:\n")
+bird_variation <- sqrt(var(bird_counts$mean_spf))
+cat("Variation in mean offspring between birds:", round(bird_variation, 3), "\n")
+cat("\n4. Key findings:\n")
+significant_relationships <- sapply(relationships, function(x) x$p_value < 0.05)
+if(any(significant_relationships)) {
+  cat("- Significant relationships found between predictors\n")
+} else {
+  cat("- No significant relationships found between predictors\n")
+}
+
+if(bird_variation > mean(bird_counts$mean_spf)/2) {
+  cat("- Substantial variation between individual birds detected\n")
+}
+```
+
+VIF Analysis Shows Serious Multicollinearity -Consider using bird ID (band) as a random effect or Consider a mixed-effects
+
+```{r}
+
+library(lme4)
+library(lmerTest)  
+library(performance)
+library(ggplot2)
+library(dplyr)
+
+data$year_scaled <- scale(data$year)
+data$x_scaled <- scale(data$x)
+data$y_scaled <- scale(data$y)
+
+# Basic random intercept model
+m1 <- lmer(fpop ~ year_scaled + x_scaled + y_scaled + (1|band),
+           data = data,
+           REML = TRUE)
+
+m2 <- lmer(fpop ~ year_scaled + x_scaled + y_scaled + (1 + year_scaled|band),
+           data = data,
+           REML = TRUE)
+
+# Compare models
+anova_comp <- anova(m1, m2)
+cat("\nModel Comparison:\n")
+print(anova_comp)
+best_model <- if(anova_comp$AIC[1] < anova_comp$AIC[2]) m1 else m2
+cat("\nBest Model Summary:\n")
+print(summary(best_model))
+
+# Check model assumptions
+cat("\nRandom Effects Normality Test:\n")
+rand_effects <- ranef(best_model)$band[,1]
+print(shapiro.test(rand_effects))
+cat("\nConvergence Check:\n")
+print(isSingular(best_model))
+cat("\nR-squared Values:\n")
+print(r2(best_model))
+
+# Visualizations
+re_plot <- ggplot(data.frame(re = ranef(best_model)$band[,1]), 
+                 aes(sample = re)) +
+  stat_qq() + stat_qq_line() +
+  labs(title = "Random Effects Q-Q Plot")
+res_plot <- ggplot(data.frame(fitted = fitted(best_model),
+                             resid = residuals(best_model)),
+                  aes(x = fitted, y = resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "Residuals vs Fitted")
+
+print(re_plot)
+print(res_plot)
+icc <- performance::icc(best_model)
+cat("\nIntraclass Correlation Coefficient:\n")
+print(icc)
+cat("\nFixed Effects Analysis:\n")
+fixef_summary <- summary(best_model)$coefficients
+print(fixef_summary)
+cat("\nRandom Effects Variance Components:\n")
+print(VarCorr(best_model))
+cat("\nIndividual Bird Variation Summary:\n")
+bird_summary <- data %>%
+  group_by(band) %>%
+  summarise(
+    n_obs = n(),
+    mean_fpop = mean(fpop),
+    sd_fpop = sd(fpop, na.rm = TRUE)
+  )
+
+print(summary(bird_summary))
+
+# Model predictions
+newdata <- expand.grid(
+  year_scaled = seq(min(data$year_scaled), 
+                   max(data$year_scaled), 
+                   length.out = 100),
+  x_scaled = mean(data$x_scaled),
+  y_scaled = mean(data$y_scaled)
+)
+
+newdata$pred <- predict(best_model, newdata, re.form = NA)
+pred_plot <- ggplot(newdata, aes(x = year_scaled, y = pred)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = pred - 1.96*sigma(best_model),
+                  ymax = pred + 1.96*sigma(best_model)),
+              alpha = 0.2) +
+  labs(title = "Population Size Predictions over Time",
+       x = "Standardized Year",
+       y = "Predicted Female Population Size")
+
+print(pred_plot)
+```
+
+
+Check if x,y are same for one band
+
+```{r}
+
+library(dplyr)
+
+band_consistency <- data %>%
+  group_by(band) %>%
+  summarize(
+    x_diff_numbers = n_distinct(x, na.rm = TRUE),
+    y_diff_numbers = n_distinct(y, na.rm = TRUE),
+    years_observed = n_distinct(year)
+  )
+
+inconsistent_bands <- band_consistency %>%
+  filter(x_diff_numbers > 1 | y_diff_numbers > 1)
+
+print(inconsistent_bands)
+
+# Extract inconsistent rows
+inconsistent_rows <- data %>%
+  filter(band %in% inconsistent_bands$band)
+
+num_inconsistent_rows <- nrow(inconsistent_rows)
+
+cat("Number of inconsistent rows(of total 742 rows):", num_inconsistent_rows, "\n")
+
+unique_band_count <- data %>%
+  summarize(unique_bands = n_distinct(band))
+
+cat("Number of unique bands in the dataset(has 190 unique inconsistant band):", unique_band_count$unique_bands, "\n")
+
+```
+
+
+heterogeneity
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(tidyr)
+library(lme4)    
+
+# Summary by year and bird
+year_bird_summary <- data %>%
+  group_by(year) %>%
+  summarise(
+    n_observations = n(),
+    n_unique_birds = n_distinct(band),
+    mean_fpop = mean(fpop, na.rm = TRUE),
+    sd_fpop = sd(fpop, na.rm = TRUE),
+    mean_spf = mean(spf, na.rm = TRUE),
+    sd_spf = sd(spf, na.rm = TRUE)
+  )
+
+bird_summary <- data %>%
+  group_by(band) %>%
+  summarise(
+    n_years = n_distinct(year),
+    mean_spf = mean(spf),
+    sd_spf = sd(spf, na.rm = TRUE),
+    mean_fpop = mean(fpop),
+    sd_fpop = sd(fpop, na.rm = TRUE)
+  )
+
+# Mixed model 
+temporal_mixed <- lmer(spf ~ factor(year) + (1|band), data = data)
+cat("\nTemporal Heterogeneity (Mixed Model):\n")
+print(anova(temporal_mixed))
+
+data$x_quadrant <- cut(data$x, breaks = 4, labels = c("West", "Central-West", "Central-East", "East"))
+data$y_quadrant <- cut(data$y, breaks = 4, labels = c("South", "Central-South", "Central-North", "North"))
+
+spatial_summary <- data %>%
+  group_by(x_quadrant, y_quadrant) %>%
+  summarise(
+    mean_spf = mean(spf),
+    sd_spf = sd(spf),
+    n_birds = n_distinct(band),
+    n = n(),
+    .groups = 'drop'
+  )
+
+bird_movement <- data %>%
+  group_by(band) %>%
+  summarise(
+    n_locations = n_distinct(paste(x, y)),
+    mean_x = mean(x),
+    mean_y = mean(y),
+    x_range = max(x) - min(x),
+    y_range = max(y) - min(y)
+  )
+
+density_mixed <- lmer(spf ~ fpop + (1|band), data = data)
+cat("\nDensity Dependence Analysis (Mixed Model):\n")
+print(summary(density_mixed))
+
+# visualization
+p5 <- ggplot(spatial_summary, 
+             aes(x = x_quadrant, y = y_quadrant)) +
+  geom_tile(aes(fill = mean_spf)) +
+  geom_text(aes(label = n_birds), size = 3) +
+  scale_fill_viridis_c() +
+  labs(title = "Mean Offspring Count by Location",
+       subtitle = "Numbers show unique birds per quadrant",
+       fill = "Mean Offspring") +
+  theme_minimal()
+print(p5)
+
+
+cat("\nIndividual Bird Movement Patterns:\n")
+print(summary(bird_movement))
+
+consistency_test <- data %>%
+  filter(n() >= 2) %>%
+  group_by(band) %>%
+  summarise(
+    spf_consistency = sd(spf),
+    location_consistency = mean(sqrt((x - mean(x))^2 + (y - mean(y))^2))
+  )
+
+cat("\nIndividual Consistency Summary:\n")
+print(summary(consistency_test))
+```
+
+
+Data description
+
+
+```{r}
+
+library(lme4)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(gridExtra)
+library(tidyr)
+library(performance)
+
+# Data Preparation
+data$x_region <- cut(data$x, breaks = 3, labels = c("West", "Central", "East"))
+data$y_region <- cut(data$y, breaks = 3, labels = c("South", "Central", "North"))
+data$fpop_cat <- cut(data$fpop, 
+                     breaks = quantile(data$fpop, probs = c(0, 0.33, 0.67, 1)), 
+                     labels = c("Low", "Medium", "High"),
+                     include.lowest = TRUE)
+data$band <- factor(data$band)
+
+# summary
+summarize_groups <- function(data, group_var) {
+  data %>%
+    group_by(!!sym(group_var)) %>%
+    summarise(
+      n = n(),
+      n_birds = n_distinct(band),
+      mean_spf = round(mean(spf, na.rm = TRUE), 3),
+      sd_spf = round(sd(spf, na.rm = TRUE), 3),
+      se_spf = round(sd_spf/sqrt(n), 3),
+      min_spf = min(spf, na.rm = TRUE),
+      max_spf = max(spf, na.rm = TRUE)
+    ) %>%
+    arrange(!!sym(group_var))
+}
+
+year_summary <- summarize_groups(data, "year")
+x_region_summary <- summarize_groups(data, "x_region")
+y_region_summary <- summarize_groups(data, "y_region")
+density_summary <- summarize_groups(data, "fpop_cat")
+
+bird_summary <- data %>%
+  group_by(band) %>%
+  summarise(
+    n_obs = n(),
+    mean_spf = round(mean(spf, na.rm = TRUE), 3),
+    sd_spf = round(sd(spf, na.rm = TRUE), 3),
+    n_years = n_distinct(year),
+    n_regions = n_distinct(paste(x_region, y_region))
+  ) %>%
+  arrange(desc(mean_spf))
+
+# Mixed Effects Models
+temp_model <- lmer(spf ~ as.factor(year) + (1|band), data = data)
+spatial_model <- lmer(spf ~ x_region + y_region + (1|band), data = data)
+density_model <- lmer(spf ~ fpop_cat + (1|band), data = data)
+combined_model <- lmer(spf ~ as.factor(year) + x_region + y_region + 
+                      fpop_cat + (1|band), data = data)
+
+# Plot
+plot_summary <- function(summary_data, x_var, title) {
+  ggplot(summary_data, aes(x = !!sym(x_var), y = mean_spf)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = mean_spf - se_spf, ymax = mean_spf + se_spf), 
+                  width = 0.2) +
+    labs(title = title,
+         x = x_var,
+         y = "Mean Offspring Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+p1 <- plot_summary(year_summary, "year", "Mean Offspring by Year")
+p2 <- plot_summary(x_region_summary, "x_region", "Mean Offspring by X Region")
+p3 <- plot_summary(y_region_summary, "y_region", "Mean Offspring by Y Region")
+p4 <- plot_summary(density_summary, "fpop_cat", "Mean Offspring by Population Density")
+
+
+p5 <- ggplot(bird_summary %>% filter(n_obs > 1), 
+             aes(x = n_obs, y = sd_spf)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "Bird Reproductive Consistency",
+       x = "Number of Observations",
+       y = "Standard Deviation in Offspring Count") +
+  theme_minimal()
+
+p6 <- ggplot(data, aes(x = year, y = spf, group = band)) +
+  geom_line(alpha = 0.2) +
+  geom_point(alpha = 0.3) +
+  labs(title = "Individual Bird Trajectories",
+       x = "Year",
+       y = "Number of Offspring") +
+  theme_minimal()
+
+p7 <- ggplot(data, aes(x = x, y = y)) +
+  geom_path(aes(group = band), alpha = 0.2) +
+  geom_point(aes(color = spf)) +
+  scale_color_viridis_c() +
+  labs(title = "Bird Movement Patterns",
+       x = "X Coordinate",
+       y = "Y Coordinate",
+       color = "Offspring Count") +
+  theme_minimal()
+
+p8 <- ggplot(bird_summary, aes(x = mean_spf)) +
+  geom_histogram(binwidth = 0.5, fill = "lightblue", color = "black") +
+  labs(title = "Distribution of Mean Offspring per Bird",
+       x = "Mean Offspring Count",
+       y = "Number of Birds") +
+  theme_minimal()
+
+p9 <- ggplot(data, aes(x = fpop, y = spf)) +
+  geom_point(aes(color = factor(band)), alpha = 0.5) +
+  facet_wrap(~year, ncol = 5) +
+  labs(title = "Density Dependence by Year",
+       x = "Female Population Size",
+       y = "Number of Offspring") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0),
+    strip.text = element_text(size = 10),
+    plot.title = element_text(size = 14),
+    panel.spacing = unit(1, "lines"),
+    axis.text = element_text(size = 8),
+    axis.title = element_text(size = 12)
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 80, by = 20),
+    limits = c(0, 80)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 12, by = 3),
+    limits = c(0, 12)
+  )
+
+# Results
+cat("\nSummary Statistics by Year:\n")
+print(year_summary)
+cat("\nSummary Statistics by X Region:\n")
+print(x_region_summary)
+cat("\nSummary Statistics by Y Region:\n")
+print(y_region_summary)
+cat("\nSummary Statistics by Population Density:\n")
+print(density_summary)
+cat("\nTemporal Model Summary:\n")
+print(summary(temp_model))
+cat("\nSpatial Model Summary:\n")
+print(summary(spatial_model))
+cat("\nDensity Model Summary:\n")
+print(summary(density_model))
+cat("\nCombined Model Summary:\n")
+print(summary(combined_model))
+cat("\nIntraclass Correlation Coefficient:\n")
+print(performance::icc(combined_model))
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+grid.arrange(p5, p6, p7, p8, ncol = 2)
+print(p9)
+par(mfrow = c(2,2))
+plot(combined_model)
+par(mfrow = c(1,1))
+
+```
+
+
+
+Hierarchical model
+
+```{r}
+
+
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+library(ggplot2)
+library(dplyr)
+
+data$x_scaled <- scale(data$x)
+data$y_scaled <- scale(data$y)
+data$fpop_scaled <- scale(data$fpop)
+
+# Model 1
+m1 <- lmer(spf ~ fpop_scaled + x_scaled + y_scaled + 
+           (1|year) + (1|band), 
+           data = data)
+
+# Model 2
+m2 <- lmer(spf ~ fpop_scaled + x_scaled + y_scaled + 
+           (1 + fpop_scaled|year) + (1|band), 
+           data = data)
+
+# comparison
+cat("\nModel Comparison:\n")
+print(anova(m1, m2))
+cat("\nFull Model Summary:\n")
+print(summary(m2))
+r2 <- r.squaredGLMM(m2)
+cat("\nR² values:\n")
+cat("Marginal R² (fixed effects):", round(r2[1,1], 3), "\n")
+cat("Conditional R² (fixed + random effects):", round(r2[1,2], 3), "\n")
+
+# ICC
+icc <- function(model) {
+  vc <- VarCorr(model)
+  var_year <- attr(vc$year, "stddev")[1]^2
+  var_band <- attr(vc$band, "stddev")[1]^2
+  var_residual <- attr(vc, "sc")^2
+  
+  icc_year <- var_year/(var_year + var_band + var_residual)
+  icc_band <- var_band/(var_year + var_band + var_residual)
+  
+  return(list(year = icc_year, band = icc_band))
+}
+
+cat("\nIntraclass Correlation Coefficients:\n")
+icc_values <- icc(m2)
+cat("ICC for year:", round(icc_values$year, 3), "\n")
+cat("ICC for band:", round(icc_values$band, 3), "\n")
+
+# plots
+p1 <- ggplot(data.frame(fitted = fitted(m2),
+                        resid = residuals(m2)), 
+             aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values",
+       y = "Residuals") +
+  theme_minimal()
+
+ranef_year <- data.frame(effects = ranef(m2)$year[,1],
+                        type = "Year")
+ranef_band <- data.frame(effects = ranef(m2)$band[,1],
+                        type = "Band")
+ranef_all <- rbind(ranef_year, ranef_band)
+
+p2 <- ggplot(ranef_all, aes(sample = effects)) +
+  geom_qq() +
+  geom_qq_line(color = "red") +
+  facet_wrap(~type) +
+  labs(title = "Random Effects Q-Q Plots") +
+  theme_minimal()
+
+new_data <- expand.grid(
+  fpop_scaled = seq(min(data$fpop_scaled), 
+                    max(data$fpop_scaled), 
+                    length.out = 50),
+  x_scaled = mean(data$x_scaled),
+  y_scaled = mean(data$y_scaled),
+  year = unique(data$year)
+)
+
+new_data$pred <- predict(m2, new_data, re.form = ~(1 + fpop_scaled|year))
+
+p3 <- ggplot(new_data, aes(x = fpop_scaled, y = pred, group = year)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(aes(group = 1), method = "lm", color = "red") +
+  labs(title = "Predicted Offspring Count vs Female Population Size",
+       subtitle = "Lines show year-specific predictions",
+       x = "Standardized Female Population Size",
+       y = "Predicted Offspring Count") +
+  theme_minimal()
+
+bird_effects <- data.frame(
+  band = rownames(ranef(m2)$band),
+  effect = ranef(m2)$band[,1]
+)
+
+p4 <- ggplot(bird_effects, aes(x = effect)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  labs(title = "Distribution of Bird Random Effects",
+       x = "Random Effect Size",
+       y = "Count") +
+  theme_minimal()
+
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+
+cat("\nFixed Effects Summary:\n")
+print(summary(m2)$coefficients)
+
+cat("\nRandom Effects Summary:\n")
+print(VarCorr(m2))
+
+# Year-specific summaries
+year_effects <- data.frame(
+  year = rownames(ranef(m2)$year),
+  intercept = ranef(m2)$year[,1],
+  slope = ranef(m2)$year[,2]
+)
+
+cat("\nYear-specific Random Effects (top 5):\n")
+print(head(year_effects, 5))
+cat("\nBird-specific Random Effects (top 5):\n")
+print(head(bird_effects, 5))
+
+# validation
+cat("\nModel Validation:\n")
+cat("Convergence:", !isSingular(m2), "\n")
+cat("Number of observations:", nobs(m2), "\n")
+cat("Number of groups - Year:", ngrps(m2)["year"], "\n")
+cat("Number of groups - Band:", ngrps(m2)["band"], "\n")
+
+```
+
+
+
+other models
+
+```{r}
+
+library(nlme)
+library(lme4)
+library(glmmTMB)
+library(mgcv)
+library(MASS)
+
+extract_fit_stats <- function(model) {
+    aic <- AIC(model)
+    bic <- BIC(model)
+    loglik <- as.numeric(logLik(model))
+    df <- attr(logLik(model), "df")
+    
+    data.frame(
+        AIC = aic,
+        BIC = bic,
+        logLik = loglik,
+        df = df
+    )
+}
+
+# GLMM with Negative Binomial
+nb_model <- glmer.nb(spf ~ fpop_scaled + x_scaled + y_scaled + 
+                     (1|year) + (1|band), 
+                     data = data)
+
+# GAM 
+gam_model <- gam(spf ~ s(fpop_scaled) + 
+                 s(x_scaled, y_scaled) + 
+                 s(year, bs = "re") +
+                 s(band, bs = "re"),
+                 family = nb(),
+                 data = data)
+
+# Spatial cluster model
+data$spatial_cluster <- paste0(
+  cut(data$x_scaled, breaks = 5),
+  "_",
+  cut(data$y_scaled, breaks = 5)
+)
+
+spatial_model <- glmer.nb(spf ~ fpop_scaled + x_scaled + y_scaled + 
+                         (1|year) + (1|band) + (1|spatial_cluster),
+                         data = data)
+
+# Compare
+model_stats <- list(
+    "Negative Binomial GLMM" = extract_fit_stats(nb_model),
+    "GAM with Spatial Smooth" = extract_fit_stats(gam_model),
+    "Spatial Cluster Model" = extract_fit_stats(spatial_model)
+)
+
+model_comparison <- do.call(rbind, model_stats)
+model_comparison$Model <- rownames(model_comparison)
+rownames(model_comparison) <- NULL
+
+# AIC
+model_comparison$deltaAIC <- model_comparison$AIC - min(model_comparison$AIC)
+model_comparison <- model_comparison[, c("Model", "AIC", "deltaAIC", "BIC", "logLik", "df")]
+cat("\nModel Comparison:\n")
+print(model_comparison, row.names = FALSE)
+
+# best model
+best_model_name <- model_comparison$Model[which.min(model_comparison$AIC)]
+cat("\nBest model based on AIC:", best_model_name, "\n")
+best_model <- switch(best_model_name,
+    "Negative Binomial GLMM" = nb_model,
+    "GAM with Spatial Smooth" = gam_model,
+    "Spatial Cluster Model" = spatial_model
+)
+
+cat("\nBest Model Summary:\n")
+print(summary(best_model))
+
+if(inherits(best_model, "glmerMod")) {
+    par(mfrow = c(2,2))
+    plot(best_model)
+    par(mfrow = c(1,1))
+    
+    ranef_year <- ranef(best_model)$year
+    ranef_band <- ranef(best_model)$band
+    
+    par(mfrow = c(1,2))
+    qqnorm(ranef_year[[1]], main = "Year Random Effects")
+    qqnorm(ranef_band[[1]], main = "Bird Random Effects")
+    par(mfrow = c(1,1))
+    
+} else if(inherits(best_model, "gam")) {
+    gam.check(best_model)
+    plot(best_model, pages = 1)
+}
+
+# predictions
+newdata <- expand.grid(
+    fpop_scaled = seq(min(data$fpop_scaled), max(data$fpop_scaled), length.out = 100),
+    x_scaled = mean(data$x_scaled),
+    y_scaled = mean(data$y_scaled)
+)
+
+if(inherits(best_model, "glmerMod")) {
+    newdata$pred <- predict(best_model, newdata, re.form = NA)
+} else if(inherits(best_model, "gam")) {
+    newdata$pred <- predict(best_model, newdata, type = "response")
+}
+
+# plot
+pred_plot <- ggplot(newdata, aes(x = fpop_scaled, y = pred)) +
+    geom_line() +
+    labs(title = "Model Predictions",
+         x = "Standardized Female Population Size",
+         y = "Predicted Offspring Count") +
+    theme_minimal()
+
+print(pred_plot)
+
+if(inherits(best_model, "glmerMod")) {
+    cat("\nRandom Effects Variances:\n")
+    print(VarCorr(best_model))
+    
+    vc <- VarCorr(best_model)
+    total_var <- sum(sapply(vc, function(x) attr(x, "stddev")^2)) + 
+                 attr(vc, "sc")^2
+    
+    cat("\nIntraclass Correlation Coefficients:\n")
+    for(re in names(vc)) {
+        icc <- attr(vc[[re]], "stddev")^2 / total_var
+        cat(re, "ICC:", round(icc, 3), "\n")
+    }
+}
+
+```
+
+Model and data analysis interpretation
+
+```{r}
+
+library(DHARMa)
+library(mgcv)
+library(ggplot2)
+library(performance)
+library(ade4)
+library(spdep)
+
+check_spatial_autocorrelation <- function(model) {
+    resids <- residuals(model)
+    coords <- cbind(data$x_scaled, data$y_scaled)
+    dist_matrix <- dist(coords)
+    resid_dist <- dist(matrix(resids, ncol=1))
+    mantel_result <- mantel.rtest(dist_matrix, resid_dist, nrepet = 999)
+    plot(as.vector(dist_matrix), 
+         as.vector(resid_dist),
+         xlab = "Spatial Distance",
+         ylab = "Residual Distance",
+         main = "Spatial Correlation in Residuals")
+    abline(lm(as.vector(resid_dist) ~ as.vector(dist_matrix)),
+           col = "red")
+    return(mantel_result)
+}
+
+cat("\nChecking Assumptions for Best Model:\n")
+
+# assumptions using DHARMa
+sim_resid <- simulateResiduals(best_model)
+plot(sim_resid)
+cat("\nDHARMa Tests:\n")
+cat("\n1. Uniformity Test:\n")
+print(testUniformity(sim_resid))
+cat("\n2. Dispersion Test:\n")
+print(testDispersion(sim_resid))
+cat("\n3. Zero-inflation Test:\n")
+print(testZeroInflation(sim_resid))
+
+# spatial autocorrelation
+cat("\nSpatial Autocorrelation Check:\n")
+spatial_autocorr <- check_spatial_autocorrelation(best_model)
+print(spatial_autocorr)
+
+# overdispersion
+overdisp <- check_overdispersion(best_model)
+cat("\nOverdispersion Check:\n")
+print(overdisp)
+
+# plots
+par(mfrow=c(2,2))
+
+plot(fitted(best_model), residuals(best_model),
+     main="Residuals vs Fitted",
+     xlab="Fitted values",
+     ylab="Residuals")
+abline(h=0, col="red")
+
+qqnorm(residuals(best_model))
+qqline(residuals(best_model), col="red")
+
+plot(data$x_scaled, residuals(best_model),
+     main="Residuals vs X coordinate",
+     xlab="X coordinate",
+     ylab="Residuals")
+abline(h=0, col="red")
+
+plot(data$y_scaled, residuals(best_model),
+     main="Residuals vs Y coordinate",
+     xlab="Y coordinate",
+     ylab="Residuals")
+abline(h=0, col="red")
+
+par(mfrow=c(1,1))
+
+cat("\nSummary of Model Diagnostics:\n")
+
+# major assumptions
+if(overdisp$dispersion_ratio > 1.2) {
+    cat("\n- Overdispersion detected (ratio =", 
+        round(overdisp$dispersion_ratio, 2), ")")
+}
+
+if(spatial_autocorr$pvalue < 0.05) {
+    cat("\n- Significant spatial autocorrelation detected (p =", 
+        round(spatial_autocorr$pvalue, 3), ")")
+}
+
+shapiro_test <- shapiro.test(residuals(best_model))
+if(shapiro_test$p.value < 0.05) {
+    cat("\n- Non-normal residuals detected (Shapiro-Wilk p =", 
+        round(shapiro_test$p.value, 3), ")")
+}
+
+
+```
+
